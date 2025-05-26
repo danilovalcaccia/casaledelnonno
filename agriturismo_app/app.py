@@ -1,15 +1,21 @@
 # --- Core Flask and Firebase Imports ---
-import os # Importato per usare le variabili d'ambiente
-import json # Importato per processare il JSON delle credenziali Firebase
+import os
+import json
 from flask import Flask, request, jsonify, session, current_app
-from firebase_admin import credentials, initialize_app, auth, firestore
-from functools import wraps # For creating decorators
-from datetime import datetime # For date handling
-import re # For regular expression matching (e.g., email validation)
-from werkzeug.exceptions import HTTPException # For handling HTTP errors globally
+# Non importare firebase_admin qui inizialmente, lo faremo nel try-except
+from functools import wraps
+from datetime import datetime
+import re
+from werkzeug.exceptions import HTTPException
 
 # --- Firebase Admin SDK Initialization (Modificato per Vercel) ---
+firebase_app_initialized = False
+db = None # Inizializza db a None
+
 try:
+    import firebase_admin # Importiamo firebase_admin qui
+    from firebase_admin import credentials, initialize_app, firestore, auth # E gli specifici moduli qui
+
     firebase_sdk_json_str = os.environ.get('FIREBASE_SERVICE_ACCOUNT_JSON_CONTENT')
     if not firebase_sdk_json_str:
         print("ATTENZIONE: La variabile d'ambiente FIREBASE_SERVICE_ACCOUNT_JSON_CONTENT non è impostata.")
@@ -25,10 +31,22 @@ try:
         except json.JSONDecodeError as e:
             raise ValueError(f"Errore nel decodificare FIREBASE_SERVICE_ACCOUNT_JSON_CONTENT: {e}")
 
-    if not firebase_admin._apps: # type: ignore
+    if not firebase_admin._apps:
         initialize_app(cred)
+        print("Firebase Admin SDK inizializzato con successo.")
+        firebase_app_initialized = True
+    else:
+        print("Firebase Admin SDK già inizializzato.")
+        firebase_app_initialized = True
+
+    if firebase_app_initialized:
+        db = firestore.client() # db viene definito SOLO se l'inizializzazione ha successo
+        print("Firestore client creato con successo.")
+    else:
+        print("ERRORE: Firebase SDK non inizializzato, db non può essere creato.")
+
 except Exception as e:
-    print(f"ERRORE CRITICO DURANTE L'INIZIALIZZAZIONE DI FIREBASE ADMIN SDK: {e}")
+    print(f"ERRORE CRITICO DURANTE L'INIZIALIZZAZIONE DI FIREBASE ADMIN SDK (blocco try principale): {e}")
 # --- Fine Blocco Inizializzazione Firebase Modificato ---
 
 # --- Flask App Initialization ---
@@ -37,14 +55,14 @@ app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'mia_chiave_segreta_default_
 if app.secret_key == 'mia_chiave_segreta_default_locale_da_cambiare_in_prod' and os.environ.get('VERCEL_ENV') == 'production':
     print("ATTENZIONE CRITICA: FLASK_SECRET_KEY sta usando il valore di default IN PRODUZIONE!")
 
-db = firestore.client()
-
 # --- Utility Decorator: Login Required ---
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'user_id' not in session:
             return jsonify({"error": "Authentication required"}), 401
+        if db is None:
+            return jsonify({"error": "Servizio database non disponibile al momento."}), 503
         return f(*args, **kwargs)
     return decorated_function
 
@@ -56,6 +74,7 @@ def hello_world():
 # --- Authentication Routes ---
 @app.route('/auth/register', methods=['POST'])
 def register():
+    if db is None: return jsonify({"error": "Servizio database non disponibile."}), 503
     data = request.get_json()
     if not data:
         return jsonify({"error": "Invalid JSON payload"}), 400
@@ -83,6 +102,8 @@ def register():
 
 @app.route('/auth/sessionLogin', methods=['POST'])
 def session_login():
+    if not firebase_app_initialized:
+         return jsonify({"error": "Servizio di autenticazione non disponibile."}), 503
     data = request.get_json()
     if not data:
         return jsonify({"error": "Invalid JSON payload."}), 400
@@ -122,7 +143,7 @@ def auth_status():
 def protected_example():
     return jsonify({"message": "This is a protected area", "user_id": session['user_id']})
 
-@firestore.transactional # type: ignore
+@firestore.transactional
 def update_product_stock_transactional(transaction, product_ref, movement_data, user_id):
     product_snapshot = transaction.get(product_ref)
     product_data = product_snapshot.to_dict() if product_snapshot.exists else {}
@@ -250,7 +271,9 @@ def create_movement():
     }
     try:
         product_ref = db.collection('products').document(product_name_stripped)
-        db.transaction().run(update_product_stock_transactional, product_ref, movement_record, user_id) # type: ignore
+        if db is None:
+            raise Exception("Firestore client (db) is not initialized.")
+        db.transaction().run(update_product_stock_transactional, product_ref, movement_record, user_id)
         new_movement_ref = db.collection('movements').add(movement_record)
         return jsonify({"message": "Movement registered successfully.", "movementId": new_movement_ref[1].id}), 201
     except ValueError as ve:
@@ -358,3 +381,25 @@ def handle_generic_exception(e):
 
 if __name__ == '__main__':
     app.run(debug=True)
+Dopo aver aggiornato app.py con questo codice:
+
+Assicurati che casaledelnonno/agriturismo_app/requirements.txt esista e contenga:
+Flask==2.2.0
+firebase-admin==6.0.1
+Werkzeug==2.2.2
+gunicorn==20.1.0
+Assicurati che casaledelnonno/agriturismo_app/vercel.json esista e contenga:
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "app.py",
+      "use": "@vercel/python",
+      "config": { "maxLambdaSize": "15mb", "runtime": "python3.9" }
+    }
+  ],
+  "routes": [
+    { "src": "/static/(.*)", "dest": "/static/$1" },
+    { "src": "/(.*)", "dest": "app.py" }
+  ]
+}
